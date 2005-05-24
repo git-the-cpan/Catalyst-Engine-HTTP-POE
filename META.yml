@@ -1,0 +1,16 @@
+---
+name: Catalyst-Engine-HTTP-POE
+version: 0.01
+author:
+  - Christian Hansen, C<ch@ngmedia.com>
+abstract: Catalyst HTTP POE Engine
+license: perl
+requires:
+  Catalyst: 5.2
+  POE: 0
+  POE::Component::Server::HTTP: 0
+provides:
+  Catalyst::Engine::HTTP::POE:
+    file: lib/Catalyst/Engine/HTTP/POE.pm
+    version: 0.01
+generated_by: Module::Build version 0.26

@@ -1,0 +1,36 @@
+NAME
+    Catalyst::Engine::HTTP::POE - Catalyst HTTP POE Engine
+
+SYNOPSIS
+    A script using the Catalyst::Engine::HTTP::POE module might look like:
+
+        #!/usr/bin/perl -w
+
+        BEGIN {  $ENV{CATALYST_ENGINE} = 'HTTP::POE' }
+
+        use strict;
+        use lib '/path/to/MyApp/lib';
+        use MyApp;
+
+        MyApp->run;
+
+DESCRIPTION
+    This the Catalyst engine use "POE::Component::Server::HTTP".
+
+OVERLOADED METHODS
+    This class overloads some methods from "Catalyst::Engine::HTTP::Base".
+
+    $c->run
+    $c->handler
+
+SEE ALSO
+    Catalyst, Catalyst::Engine, Catalyst::Engine::HTTP::Base,
+    POE::Component::Server::HTTP.
+
+AUTHOR
+    Christian Hansen, "ch@ngmedia.com"
+
+COPYRIGHT
+    This program is free software, you can redistribute it and/or modify it
+    under the same terms as Perl itself.
+
