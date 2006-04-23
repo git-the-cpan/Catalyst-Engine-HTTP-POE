@@ -1,34 +1,42 @@
 NAME
-    Catalyst::Engine::HTTP::POE - Catalyst HTTP POE Engine
+    Catalyst::Engine::HTTP::POE - Single-threaded multi-tasking Catalyst
+    engine
 
-SYNOPSIS
-    A script using the Catalyst::Engine::HTTP::POE module might look like:
-
-        #!/usr/bin/perl -w
-
-        BEGIN {  $ENV{CATALYST_ENGINE} = 'HTTP::POE' }
-
-        use strict;
-        use lib '/path/to/MyApp/lib';
-        use MyApp;
-
-        MyApp->run;
+SYNOPIS
+        CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
 
 DESCRIPTION
-    This the Catalyst engine use "POE::Component::Server::HTTP".
+    This engine allows Catalyst to process multiple requests in parallel
+    within a single process. Much of the internal Catalyst flow now uses POE
+    yield calls. Application code will still block of course, but all I/O,
+    header processing, and POST body processing is handled asynchronously.
 
-OVERLOADED METHODS
-    This class overloads some methods from "Catalyst::Engine::HTTP::Base".
+    A good example of the engine's power is the
+    Catalyst::Plugin::UploadProgress demo application, which can process a
+    file upload as well as an Ajax polling request at the same time in the
+    same process.
 
-    $c->run
-    $c->handler
+    Note that this engine requires at least Catalyst 5.67 (or trunk revision
+    3742 or higher).
 
-SEE ALSO
-    Catalyst, Catalyst::Engine, Catalyst::Engine::HTTP::Base,
-    POE::Component::Server::HTTP.
+DEBUGGING
+    To enable trace-level debugging, set the environment variable
+    CATALYST_POE_DEBUG.
+
+    At any time you can get a dump of the internal state of the engine by
+    sending a USR1 signal to the running process.
+
+EXPERIMENTAL STATUS
+    This engine should still be considered experimental and likely has bugs,
+    however as it's only intended for development, please use it and report
+    bugs.
+
+    The engine has been tested with the UploadProgress demo, the Streaming
+    example, and one of my own moderately large applications. It also fully
+    passes the Catalyst test suite.
 
 AUTHOR
-    Christian Hansen, "ch@ngmedia.com"
+    Andy Grundman, <andy@hybridized.org>
 
 COPYRIGHT
     This program is free software, you can redistribute it and/or modify it

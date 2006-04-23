@@ -1,4 +1,8 @@
 This file documents the revision history for Catalyst::Engine::HTTP::POE.
 
+0.02  2006-04-22 22:00:00
+        - Full support for Catalyst 5.67+, streaming I/O, etc.
+        - Can handle UploadProgress in a single thread!
+
 0.01  2005-05-24 21:59:00
-        - Initial release
+        - Initial release for Catalyst 5.33 (chansen).
