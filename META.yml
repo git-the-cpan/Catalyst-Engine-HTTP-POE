@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name: Catalyst-Engine-HTTP-POE
-version: 0.02
+version: 0.03
 author:
   - Andy Grundman, <andy@hybridized.org>
 abstract: Single-threaded multi-tasking Catalyst engine

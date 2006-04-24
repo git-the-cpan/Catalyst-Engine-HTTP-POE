@@ -13,7 +13,7 @@ use POE::Wheel::ReadWrite;
 use POE::Wheel::SocketFactory;
 use Socket;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 # Enable for helpful debugging information
 sub DEBUG { $ENV{CATALYST_POE_DEBUG} || 0 }
