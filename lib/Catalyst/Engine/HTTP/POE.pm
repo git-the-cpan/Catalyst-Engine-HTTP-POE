@@ -13,7 +13,7 @@ use POE::Wheel::ReadWrite;
 use POE::Wheel::SocketFactory;
 use Socket;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 # Enable for helpful debugging information
 sub DEBUG { $ENV{CATALYST_POE_DEBUG} || 0 }
@@ -272,14 +272,35 @@ sub parse_headers {
 
 sub process {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
+
+    my $class = $self->{config}->{appclass};
+
+    # This request may be executing within another request,
+    # so we must localize all of NEXT so it doesn't get confused about what's
+    # already been called
+    local $NEXT::NEXT{ $class, 'prepare' };
+    local $NEXT::NEXT{ $class, 'prepare_request' };
+    local $NEXT::NEXT{ $class, 'prepare_connection' };
+    local $NEXT::NEXT{ $class, 'prepare_query_parameters' };
+    local $NEXT::NEXT{ $class, 'prepare_headers' };
+    local $NEXT::NEXT{ $class, 'prepare_cookies' };
+    local $NEXT::NEXT{ $class, 'prepare_path' };
+    local $NEXT::NEXT{ $class, 'prepare_body' };
+
+    local $NEXT::NEXT{ $class, 'finalize_uploads' };
+    local $NEXT::NEXT{ $class, 'finalize_error' };
+    local $NEXT::NEXT{ $class, 'finalize_headers' };
+    local $NEXT::NEXT{ $class, 'finalize_body' };
     
     # pass flow control to Catalyst
-    my $status = $self->{config}->{appclass}->handle_request( $ID );
+    my $status = $class->handle_request( $ID );
 }
 
 # Prepare handles the entire prepare stage so we can yield to each step
 sub prepare {
     my ( $self, $c, $ID ) = @_;
+
+    DEBUG && warn "[$ID] - prepare\n";
 
     # store our ID in context
     $c->{_POE_ID} = $ID;
@@ -312,6 +333,8 @@ sub prepare {
     while ( !$client->{_prepare_done} ) {
         $poe_kernel->run_one_timeslice();
     }
+
+    return $c;
 }
 
 # handle_prepare localizes our per-client %ENV and calls $c->$method
