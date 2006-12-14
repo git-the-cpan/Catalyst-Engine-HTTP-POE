@@ -4,6 +4,9 @@ NAME
 
 SYNOPIS
         CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
+    
+        # Prefork 5 children
+        CATALYST_POE_MAX_PROC=6 CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
 
 DESCRIPTION
     This engine allows Catalyst to process multiple requests in parallel
@@ -16,8 +19,19 @@ DESCRIPTION
     file upload as well as an Ajax polling request at the same time in the
     same process.
 
-    Note that this engine requires at least Catalyst 5.67 (or trunk revision
-    3742 or higher).
+    This engine requires at least Catalyst 5.67.
+
+RESTART SUPPORT
+    As of version 0.05, the -r flag is supported and the server will restart
+    itself when any application files are modified.
+
+PREFORKING
+    As of version 0.05, the engine is able to prefork a set number of child
+    processes to distribute requests. Set the CATALYST_POE_MAX_PROC
+    environment variable to the total number of processes you would like to
+    run, including the parent process. So, to prefork 5 children, set this
+    value to 6. This value may also be set by modifying yourapp_server.pl
+    and adding max_proc to the options hash passed to YourApp->run().
 
 DEBUGGING
     To enable trace-level debugging, set the environment variable

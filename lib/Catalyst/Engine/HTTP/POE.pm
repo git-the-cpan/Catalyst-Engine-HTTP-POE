@@ -3,7 +3,7 @@ package Catalyst::Engine::HTTP::POE;
 use strict;
 use warnings;
 use base 'Catalyst::Engine::HTTP';
-use Data::Dumper;
+use Data::Dump;
 use HTTP::Body;
 use HTTP::Status ();
 use POE;
@@ -13,13 +13,18 @@ use POE::Wheel::ReadWrite;
 use POE::Wheel::SocketFactory;
 use Socket;
 
-our $VERSION = '0.04';
+use Catalyst::Engine::HTTP::Restarter::Watcher;
+
+our $VERSION = '0.05';
 
 # Enable for helpful debugging information
 sub DEBUG { $ENV{CATALYST_POE_DEBUG} || 0 }
 
 # sysread block size
 sub BLOCK_SIZE { 4096 }
+
+# Max processes (including parent)
+sub MAX_PROC { $ENV{CATALYST_POE_MAX_PROC} || 1 }
 
 sub run { 
     my ( $self, $class, @args ) = @_;
@@ -42,10 +47,13 @@ sub spawn {
     }
     
     $self->{config} = {
-        appclass => $class,
-        addr     => $addr,
-        port     => $port,
-        host     => $host,
+        appclass   => $class,
+        addr       => $addr,
+        port       => $port,
+        host       => $host,
+        options    => $options,
+        children   => {},
+        is_a_child => 0,
     };
     
     POE::Session->create(
@@ -54,7 +62,14 @@ sub spawn {
                 qw/_start
                    _stop
                    shutdown
+                   child_shutdown
                    dump_state
+                   
+                   prefork
+                   sig_chld
+                   
+                   check_restart
+                   restart
                    
                    accept_new_client
                    accept_failed
@@ -108,10 +123,23 @@ sub _start {
     );
 
     # dump our state if we get a SIGUSR1
-    $kernel->sig( 'USR1', 'dump_state' );
+    $kernel->sig( USR1 => 'dump_state' );
 
     # shutdown on INT
-    $kernel->sig( 'INT', 'shutdown' );
+    $kernel->sig( INT => 'shutdown' );
+    
+    # Pre-fork if requested
+    $self->{config}->{options}->{max_proc} ||= MAX_PROC;
+    if ( $self->{config}->{options}->{max_proc} > 1 ) {
+        $kernel->sig( CHLD => 'sig_chld' );
+        $kernel->yield( 'prefork' );
+    }
+    
+    # Init restarter
+    if ( $self->{config}->{options}->{restart} ) {
+        my $delay = $self->{config}->{options}->{restart_delay} || 1;
+        $kernel->delay_set( 'check_restart', $delay );
+    }
     
     my $url = 'http://' . $self->{config}->{host};
     $url .= ':' . $self->{config}->{port}
@@ -125,12 +153,25 @@ sub _stop { }
 sub shutdown {
     my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
     
+    DEBUG && warn "Shutting down...\n";
+    
+    if ( my @children = keys %{ $self->{config}->{children} } ) {
+        DEBUG && warn "Signaling all children to stop...\n";
+        kill INT => @children;
+    }
+    
     delete $self->{listener};
     delete $self->{clients};
     
     $kernel->alias_remove( 'catalyst-poe' );
+    
+    return 1;
+}
 
-    DEBUG && warn "Shutting down...\n";
+sub child_shutdown {
+    my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
+
+    return 0;
 }
 
 sub dump_state {
@@ -138,8 +179,106 @@ sub dump_state {
 
     my $clients = scalar keys %{ $self->{clients} };
     warn "-- POE Engine State --\n";
-    warn Dumper( $self );
+    warn Data::Dump::dump( $self );
     warn "Active clients: $clients\n";
+}
+
+sub prefork {
+    my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
+    
+    return if $self->{config}->{is_a_child};
+    
+    my $max_proc = $self->{config}->{options}->{max_proc};
+    
+    DEBUG && warn 'Preforking ' . ( $max_proc - 1 ) . " children...\n";
+    
+    my $current_children = keys %{ $self->{config}->{children} };
+    for ( $current_children + 2 .. $max_proc ) {
+        
+        my $pid = fork();
+        
+        unless ( defined $pid ) {
+            DEBUG && warn "Server $$ fork failed: $!\n";
+            $kernel->delay_set( prefork => 1 );
+            return;
+        }
+        
+        # Parent.  Add the child process to its list.
+        if ( $pid ) {
+            $self->{config}->{children}->{$pid} = 1;
+            next;
+        }
+        
+        # Child.  Clear the child process list.
+        DEBUG && warn "Child $$ forked successfully.\n";
+        $self->{config}->{is_a_child} = 1;
+        $self->{config}->{children}   = {};
+        
+        $kernel->sig( INT => 'child_shutdown' );
+        
+        return;
+    }
+}
+
+sub sig_chld {
+    my ( $kernel, $self, $child_pid ) = @_[ KERNEL, OBJECT, ARG1 ];
+
+    if ( delete $self->{config}->{children}->{$child_pid} ) {
+        DEBUG && warn "Server $$ received SIGCHLD from $child_pid.\n";
+        $kernel->yield( 'prefork' );
+    }
+    return 0;
+}
+
+sub check_restart {
+    my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
+    
+    # Only check in the parent process
+    return if $self->{config}->{is_a_child};
+    
+    my $options = $self->{config}->{options};
+    
+    # Init watcher object with no delay
+    if ( !$self->{watcher} ) {        
+        $self->{watcher} = Catalyst::Engine::HTTP::Restarter::Watcher->new(
+            directory => ( 
+                $options->{restart_directory} || 
+                File::Spec->catdir( $FindBin::Bin, '..' )
+            ),
+            regex     => $options->{restart_regex},
+            # current Cat versions will 'sleep 1' if this is 0
+            delay     => 0.00000000001,
+        );
+    }
+    
+    my @changed_files = $self->{watcher}->watch();
+    
+    # Restart if any files have changed
+    if (@changed_files) {
+        my $files = join ', ', @changed_files;
+        print STDERR qq/File(s) "$files" modified, restarting\n\n/;
+        
+        $kernel->yield( 'restart' );
+    }
+    else {
+        # Schedule next check
+        $kernel->delay_set( 'check_restart', $options->{restart_delay} );
+    }
+}
+
+sub restart {
+    my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
+    
+    $kernel->call( 'catalyst-poe', 'shutdown' );
+    
+    ### if the standalone server was invoked with perl -I .. we will loose
+    ### those include dirs upon re-exec. So add them to PERL5LIB, so they
+    ### are available again for the exec'ed process --kane
+    use Config;
+    $ENV{PERL5LIB} .= join $Config{path_sep}, @INC;
+    
+    my $options = $self->{config}->{options};
+    exec $^X . ' "' . $0 . '" ' . join( ' ', @{ $options->{argv} } );
 }
 
 sub accept_new_client {
@@ -177,7 +316,7 @@ sub accept_new_client {
     $self->{clients}->{$ID}->{driver}    = POE::Driver::SysRW->new;
     $self->{clients}->{$ID}->{socket}    = $socket;
     
-    DEBUG && warn "[$ID] New connection\n";
+    DEBUG && warn "[$ID] [$$] New connection\n";
 
     # Wait for some data to read
     $self->{clients}->{$ID}->{ibuf} = '';
@@ -197,7 +336,7 @@ sub client_error {
     my $errnum = $_[ ARG1 ];
     my $errstr = $_[ ARG2 ];
     
-    DEBUG && warn "[$ID] Wheel generated $op error $errnum: $errstr\n";
+    DEBUG && warn "[$ID] [$$] Wheel generated $op error $errnum: $errstr\n";
     
     delete $self->{clients}->{$ID};
 }
@@ -209,7 +348,7 @@ sub read_headers {
 
     my $line = $self->_get_line( $handle );
 
-    DEBUG && warn "[$ID] Buffering input: $line\n";
+    DEBUG && warn "[$ID] [$$] Buffering input: $line\n";
     $client->{ibuf} .= $line . "\n";
 
     if ( $line eq '' ) {
@@ -224,7 +363,7 @@ sub parse_headers {
 
     my $client = $self->{clients}->{$ID};
 
-    DEBUG && warn "[$ID] parse_headers\n";
+    DEBUG && warn "[$ID] [$$] parse_headers\n";
 
     my @lines = split /\n/, delete $client->{ibuf};
 
@@ -300,7 +439,7 @@ sub process {
 sub prepare {
     my ( $self, $c, $ID ) = @_;
 
-    DEBUG && warn "[$ID] - prepare\n";
+    DEBUG && warn "[$ID] [$$] - prepare\n";
 
     # store our ID in context
     $c->{_POE_ID} = $ID;
@@ -342,7 +481,7 @@ sub prepare {
 sub handle_prepare {
     my ( $kernel, $self, $method, $ID ) = @_[ KERNEL, OBJECT, ARG0, ARG1 ];
     
-    DEBUG && warn "[$ID] - $method\n";
+    DEBUG && warn "[$ID] [$$] - $method\n";
     
     my $client = $self->{clients}->{$ID};
     
@@ -371,7 +510,7 @@ sub prepare_body {
         return $poe_kernel->yield( 'prepare_done', $ID );
     }
    
-    DEBUG && warn "[$ID] Starting to read POST data (length: $length)\n";
+    DEBUG && warn "[$ID] [$$] Starting to read POST data (length: $length)\n";
 
     # set block size to read
     my $driver = $client->{driver};
@@ -393,7 +532,7 @@ sub read_body_chunk {
 
     my $client = $self->{clients}->{$ID};
 
-    DEBUG && warn "[$ID] read_body_chunk\n";
+    DEBUG && warn "[$ID] [$$] read_body_chunk\n";
 
     if ( my $buffer_ref = $client->{driver}->get( $handle ) ) {
         for my $buffer ( @{$buffer_ref} ) {
@@ -427,8 +566,8 @@ sub read_body_chunk {
 sub prepare_done {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
     
-    DEBUG && warn "[$ID] prepare_done\n";
-#    DEBUG && warn Dumper( $self->{clients}->{$ID}->{context} );
+    DEBUG && warn "[$ID] [$$] prepare_done\n";
+#    DEBUG && warn Data::Dump::dump( $self->{clients}->{$ID}->{context} );
 
     $self->{clients}->{$ID}->{_prepare_done} = 1;
 }
@@ -464,7 +603,7 @@ sub finalize {
 sub handle_finalize {
     my ( $kernel, $self, $method, $ID ) = @_[ KERNEL, OBJECT, ARG0, ARG1 ];
     
-    DEBUG && warn "[$ID] - $method\n";
+    DEBUG && warn "[$ID] [$$] - $method\n";
 
     my $client = $self->{clients}->{$ID};
 
@@ -504,7 +643,7 @@ sub finalize_headers {
 sub finalize_done {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
     
-    DEBUG && warn "[$ID] finalize_done\n";
+    DEBUG && warn "[$ID] [$$] finalize_done\n";
 
     my $client = $self->{clients}->{$ID};
 
@@ -524,7 +663,7 @@ sub write {
     my $cl = $client->{context}->response->content_length;
     if ( $cl ) {
         $client->{_written} += length $buffer;
-        DEBUG && warn "[$ID] written: " . $client->{_written} . "\n";
+        DEBUG && warn "[$ID] [$$] written: " . $client->{_written} . "\n";
     }
 
     # if the output buffer has reached the highmark, we have a
@@ -546,7 +685,7 @@ sub client_flushed {
     # Are we done writing?
     my $cl = $client->{context}->response->content_length;
     if ( $cl && $client->{_written} >= $cl ) {
-        DEBUG && warn "[$ID] client_flushed, written full content-length\n";
+        DEBUG && warn "[$ID] [$$] client_flushed, written full content-length\n";
         $kernel->yield( 'client_done', $ID );
     }
 
@@ -567,7 +706,7 @@ sub client_done {
     # clean up everything about this client
     delete $self->{clients}->{$ID};
 
-    DEBUG && warn "[$ID] client_done\n";
+    DEBUG && warn "[$ID] [$$] client_done\n";
 }
 
 1;
@@ -579,6 +718,9 @@ Catalyst::Engine::HTTP::POE - Single-threaded multi-tasking Catalyst engine
 =head1 SYNOPIS
 
     CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
+    
+    # Prefork 5 children
+    CATALYST_POE_MAX_PROC=6 CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
 
 =head1 DESCRIPTION
 
@@ -591,8 +733,20 @@ A good example of the engine's power is the L<Catalyst::Plugin::UploadProgress> 
 application, which can process a file upload as well as an Ajax polling request
 at the same time in the same process.
 
-Note that this engine requires at least Catalyst 5.67 (or trunk revision 3742 or
-higher).
+This engine requires at least Catalyst 5.67.
+
+=head1 RESTART SUPPORT
+
+As of version 0.05, the -r flag is supported and the server will restart itself when any
+application files are modified.
+
+=head1 PREFORKING
+
+As of version 0.05, the engine is able to prefork a set number of child processes to distribute
+requests.  Set the CATALYST_POE_MAX_PROC environment variable to the total number of processes
+you would like to run, including the parent process.  So, to prefork 5 children, set this value
+to 6.  This value may also be set by modifying yourapp_server.pl and adding max_proc to the
+options hash passed to YourApp->run().
 
 =head1 DEBUGGING
 
