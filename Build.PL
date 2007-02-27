@@ -6,8 +6,8 @@ my $build = Module::Build->new(
     license            => 'perl',
     module_name        => 'Catalyst::Engine::HTTP::POE',
     requires           => {
-        'Catalyst'                     => '5.67',
-        'POE'                          => 0,
+        'Catalyst' => '5.67',
+        'POE'      => '0',
     },
     create_makefile_pl => 'passthrough',
     create_readme      => 1,

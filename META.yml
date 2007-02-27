@@ -1,8 +1,20 @@
---- #YAML:1.0
+---
 name: Catalyst-Engine-HTTP-POE
-version: 0.05
+version: 0.06
 author:
-  - Andy Grundman, <andy@hybridized.org>
+  - 'Andy Grundman, <andy@hybridized.org>'
 abstract: Single-threaded multi-tasking Catalyst engine
 license: perl
-generated_by: Module::Build version 0.2612, without YAML.pm
+resources:
+  license: http://dev.perl.org/licenses/
+requires:
+  Catalyst: 5.67
+  POE: 0
+provides:
+  Catalyst::Engine::HTTP::POE:
+    file: lib/Catalyst/Engine/HTTP/POE.pm
+    version: 0.06
+generated_by: Module::Build version 0.2806
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2

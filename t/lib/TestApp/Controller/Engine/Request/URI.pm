@@ -41,6 +41,17 @@ sub uri_with : Local {
     $c->forward('TestApp::View::Dump::Request');
 }
 
+sub uri_with_object : Local {
+    my ( $self, $c ) = @_;
+
+    my $uri   = $c->req->uri_with( { a => $c->req->base } );
+    my %query = $uri->query_form;
+    
+    $c->res->header( 'X-Catalyst-Param-a' => $query{ a } );
+    
+    $c->forward('TestApp::View::Dump::Request');
+}
+
 sub uri_with_utf8 : Local {
     my ( $self, $c ) = @_;
 
@@ -48,6 +59,20 @@ sub uri_with_utf8 : Local {
     my $uri = $c->req->uri_with( { unicode => "\x{2620}" } );
     
     $c->res->header( 'X-Catalyst-uri-with' => "$uri" );
+    
+    $c->forward('TestApp::View::Dump::Request');
+}
+
+sub uri_with_undef : Local {
+    my ( $self, $c ) = @_;
+
+    my $warnings = 0;
+    local $SIG{__WARN__} = sub { $warnings++ };
+
+    # change the current uri
+    my $uri = $c->req->uri_with( { foo => undef } );
+    
+    $c->res->header( 'X-Catalyst-warnings' => $warnings );
     
     $c->forward('TestApp::View::Dump::Request');
 }

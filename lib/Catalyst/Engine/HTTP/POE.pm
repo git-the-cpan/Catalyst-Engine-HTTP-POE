@@ -3,28 +3,42 @@ package Catalyst::Engine::HTTP::POE;
 use strict;
 use warnings;
 use base 'Catalyst::Engine::HTTP';
-use Data::Dump;
+use Data::Dump qw(dump);
 use HTTP::Body;
+use HTTP::Date ();
+use HTTP::Headers;
+use HTTP::Response;
 use HTTP::Status ();
 use POE;
-use POE::Driver::SysRW;
+use POE::Filter::Line;
 use POE::Filter::Stream;
 use POE::Wheel::ReadWrite;
 use POE::Wheel::SocketFactory;
 use Socket;
+use Time::HiRes;
 
 use Catalyst::Engine::HTTP::Restarter::Watcher;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 # Enable for helpful debugging information
-sub DEBUG { $ENV{CATALYST_POE_DEBUG} || 0 }
-
-# sysread block size
-sub BLOCK_SIZE { 4096 }
+sub DEBUG () { $ENV{CATALYST_POE_DEBUG} || 0 }
+sub BENCH () { $ENV{CATALYST_POE_BENCH} || 0 }
 
 # Max processes (including parent)
-sub MAX_PROC { $ENV{CATALYST_POE_MAX_PROC} || 1 }
+sub MAX_PROC () { $ENV{CATALYST_POE_MAX_PROC} || 1 }
+
+# Keep-alive connection timeout in seconds
+sub KEEPALIVE_TIMEOUT () { 300 }
+
+# Benchmark::Stopwatch for profiling
+if ( BENCH ) {
+    require Benchmark::Stopwatch;
+}
+
+$SIG{__WARN__} = sub {
+    warn '[' . sprintf( "%.4f", Time::HiRes::time() ) . '] ' . shift;
+};
 
 sub run { 
     my ( $self, $class, @args ) = @_;
@@ -77,17 +91,18 @@ sub spawn {
                    client_flushed
                    client_error
                    
-                   read_headers
-                   parse_headers
+                   read_input
+                   process_input
                    process
 
                    handle_prepare
-                   read_body_chunk
                    prepare_done
 
                    handle_finalize
                    finalize_done
                    client_done
+                   
+                   keepalive_timeout
                /
            ],
        ],
@@ -179,7 +194,7 @@ sub dump_state {
 
     my $clients = scalar keys %{ $self->{clients} };
     warn "-- POE Engine State --\n";
-    warn Data::Dump::dump( $self );
+    warn dump( $self );
     warn "Active clients: $clients\n";
 }
 
@@ -284,12 +299,17 @@ sub restart {
 sub accept_new_client {
     my ( $kernel, $self, $socket, $peeraddr, $peerport ) 
         = @_[ KERNEL, OBJECT, ARG0 .. ARG2 ];
+    
+    my $stopwatch;
+    if ( BENCH ) {
+        $stopwatch = Benchmark::Stopwatch->new->start;
+    }
 
     $peeraddr = inet_ntoa($peeraddr);
     
     my $wheel = POE::Wheel::ReadWrite->new(
         Handle       => $socket,
-        OutputFilter => POE::Filter::Stream->new,
+        Filter       => POE::Filter::Stream->new,
         FlushedEvent => 'client_flushed',
         ErrorEvent   => 'client_error',
         HighMark     => 128 * 1024,
@@ -306,107 +326,178 @@ sub accept_new_client {
     
     my $ID = $wheel->ID;
     
-    $self->{clients}->{$ID}->{wheel}     = $wheel;
-    $self->{clients}->{$ID}->{peeraddr}  = $peeraddr;
-    $self->{clients}->{$ID}->{peerport}  = $peerport;
-    $self->{clients}->{$ID}->{localaddr} = $localaddr;
-    $self->{clients}->{$ID}->{localname} = $localname;
-
-    # Use a SysRW driver for better input control than we can get from a Wheel
-    $self->{clients}->{$ID}->{driver}    = POE::Driver::SysRW->new;
-    $self->{clients}->{$ID}->{socket}    = $socket;
+    $self->{clients}->{$ID} = {
+        wheel     => $wheel,
+        socket    => $socket,
+        peeraddr  => $peeraddr,
+        peerport  => $peerport,
+        localaddr => $localaddr,
+        localname => $localname,
+        
+        requests  => 0,
+        inputbuf  => '',
+        written   => 0,
+        
+        stopwatch => $stopwatch,
+    };
     
-    DEBUG && warn "[$ID] [$$] New connection\n";
+    DEBUG && warn "[$ID] [$$] New connection (wheel $ID from $peeraddr:$peerport)\n";
 
     # Wait for some data to read
-    $self->{clients}->{$ID}->{ibuf} = '';
-    $poe_kernel->select_read( $socket, 'read_headers', $ID );
+    $poe_kernel->select_read( $socket, 'read_input', $ID );
 }
 
 sub accept_failed {
-    my ( $kernel, $self ) = @_[ KERNEL, OBJECT ];
+    my ( $kernel, $self, $op, $errnum, $errstr ) = @_[ KERNEL, OBJECT, ARG0 .. ARG2 ];
+    
+    warn "Unable to start server: $op error $errnum: $errstr\n";
     
     $kernel->yield('shutdown');
 }
 
 sub client_error {
-    my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG3 ];
-    
-    my $op     = $_[ ARG0 ];
-    my $errnum = $_[ ARG1 ];
-    my $errstr = $_[ ARG2 ];
+    my ( $kernel, $self, $op, $errnum, $errstr, $ID ) = @_[ KERNEL, OBJECT, ARG0 .. ARG3 ];
     
     DEBUG && warn "[$ID] [$$] Wheel generated $op error $errnum: $errstr\n";
     
     delete $self->{clients}->{$ID};
 }
 
-sub read_headers {
+sub read_input {
     my ( $kernel, $self, $handle, $ID ) = @_[ KERNEL, OBJECT, ARG0, ARG2 ];
-
-    my $client = $self->{clients}->{$ID};
-
-    my $line = $self->_get_line( $handle );
-
-    DEBUG && warn "[$ID] [$$] Buffering input: $line\n";
-    $client->{ibuf} .= $line . "\n";
-
-    if ( $line eq '' ) {
-        # Headers done
-        $kernel->select_read( $handle );
-        $kernel->yield( 'parse_headers', $ID );
+    
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap('read_input');
+    
+    # Clear the keepalive timeout timer if set
+    if ( my $timer = delete $client->{_timeout_timer} ) {
+        $kernel->alarm_remove( $timer );
     }
+    
+    # Read some data from the driver
+    my $driver = $client->{wheel}->[ $client->{wheel}->DRIVER_BOTH ];
+    my $buffer_ref = $driver->get( $handle );
+        
+    if ( !$buffer_ref ) {
+        # Error, stop reading and shut down this client
+        DEBUG && warn "[$ID] [$$] Error reading, disconnecting\n";
+        $kernel->select_read( $handle );
+        delete $self->{clients}->{$ID};
+        return;
+    }
+        
+    $client->{inputbuf} .= join '', @{$buffer_ref};
+        
+    DEBUG && warn "[$ID] [$$] read_input (" . length( $client->{inputbuf} ) . " bytes in buffer)\n";
+    
+    $kernel->yield( 'process_input', $ID );
 }
 
-sub parse_headers {
+sub process_input {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
-
-    my $client = $self->{clients}->{$ID};
-
-    DEBUG && warn "[$ID] [$$] parse_headers\n";
-
-    my @lines = split /\n/, delete $client->{ibuf};
-
-    # parse the request line
-    my $line = shift @lines;
-    my ( $method, $uri, $protocol ) =
-        $line =~ m/\A(\w+)\s+(\S+)(?:\s+HTTP\/(\d+(?:\.\d+)?))?\z/;
-        
-    # Initialize CGI environment
-    my ( $path, $query_string ) = split /\?/, $uri, 2;
-    my %env = (
-        PATH_INFO       => $path         || '',
-        QUERY_STRING    => $query_string || '',
-        REMOTE_ADDR     => $client->{peeraddr},
-        REMOTE_HOST     => $client->{peeraddr},
-        REQUEST_METHOD  => $method || '',
-        SERVER_NAME     => $client->{localname},
-        SERVER_PORT     => $self->{config}->{port},
-        SERVER_PROTOCOL => "HTTP/$protocol",
-        %{ $self->{global_env} },
-    );
     
-    for $line ( @lines ) {
-        last if $line eq '';
-        next unless my ( $name, $value ) 
-            = $line =~ m/\A(\w(?:-?\w+)*):\s(.+)\z/;
-
-        $name = uc $name;
-        $name = 'COOKIE' if $name eq 'COOKIES';
-        $name =~ tr/-/_/;
-        $name = 'HTTP_' . $name
-          unless $name =~ m/\A(?:CONTENT_(?:LENGTH|TYPE)|COOKIE)\z/;
-        if ( exists $env{$name} ) {
-            $env{$name} .= "; $value";
-        }
-        else {
-            $env{$name} = $value;
-        }
+    my $client = $self->{clients}->{$ID} || return;
+    
+    # Have we started processing the body?
+    if ( exists $client->{_read} ) {
+        
+        _process_chunk( $client );
+                
+        return;
     }
     
-    $client->{env} = \%env;
+    # Have we already parsed headers
+    return if $client->{_headers};
     
-    $kernel->yield( 'process', $ID );
+    # Have we read enough to include all headers?
+    if ( $client->{inputbuf} =~ /(\x0D\x0A?\x0D\x0A?|\x0A\x0D?\x0A\x0D?)/s ) {
+        $client->{_headers} = 1;
+
+        # Copy the buffer for header parsing, and remove the header block
+        # from the content buffer.
+        my $buf = $client->{inputbuf};
+        $client->{inputbuf} =~ s/.*?(\x0D\x0A?\x0D\x0A?|\x0A\x0D?\x0A\x0D?)//s;
+        
+        # Parse the request line.
+        if ( $buf !~ s/^(\w+)[ \t]+(\S+)(?:[ \t]+(HTTP\/\d+\.\d+))?[^\012]*\012// ) {
+            # Invalid request
+            DEBUG && warn "[$ID] [$$] Bad request: $buf\n";
+
+            my $status   = 400;
+            my $message  = HTTP::Status::status_message($status);
+            my $response = HTTP::Response->new( $status => $message );
+            $response->content_type( 'text/plain' );
+            $response->content( "$status $message" );
+            # XXX: fix to use CRLF
+            $client->{wheel}->put( $response->as_string );
+            return;
+        }
+        
+        my $method = $1;
+        my $uri    = $2;
+        my $proto  = $3 || 'HTTP/0.9';
+        
+        DEBUG && warn "[$ID] [$$] process_input: Parsing headers ($method $uri $proto)\n";
+        
+        # Initialize CGI environment
+        my ( $path, $query_string ) = split /\?/, $uri, 2;
+        my %env = (
+            PATH_INFO       => $path         || '',
+            QUERY_STRING    => $query_string || '',
+            REMOTE_ADDR     => $client->{peeraddr},
+            REMOTE_HOST     => $client->{peeraddr},
+            REQUEST_METHOD  => $method || '',
+            SERVER_NAME     => $client->{localname},
+            SERVER_PORT     => $self->{config}->{port},
+            SERVER_PROTOCOL => $proto,
+            %{ $self->{global_env} },
+        );
+        
+        # Parse headers
+        my $headers = HTTP::Headers->new;
+        my ($key, $val);
+        HEADER:
+        while ( $buf =~ s/^([^\012]*)\012// ) {
+            $_ = $1;
+            s/\015$//;
+            if ( /^([\w\-~]+)\s*:\s*(.*)/ ) {
+                $headers->push_header( $key, $val ) if $key;
+                ($key, $val) = ($1, $2);
+            }
+            elsif ( /^\s+(.*)/ ) {
+                $val .= " $1";
+            }
+            else {
+                last HEADER;
+            }
+        }
+        $headers->push_header( $key, $val ) if $key;
+        
+        DEBUG && warn "[$ID] [$$] " . dump($headers) . "\n";
+
+        # Convert headers into ENV vars
+        $headers->scan( sub {
+            my ( $key, $val ) = @_;
+            
+            $key = uc $key;
+            $key = 'COOKIE' if $key eq 'COOKIES';
+            $key =~ tr/-/_/;
+            $key = 'HTTP_' . $key
+                unless $key =~ m/\A(?:CONTENT_(?:LENGTH|TYPE)|COOKIE)\z/;
+                
+            if ( exists $env{$key} ) {
+                $env{$key} .= ", $val";
+            }
+            else {
+                $env{$key} = $val;
+            }
+        } );
+        
+        $client->{env} = \%env;
+        
+        $kernel->yield( 'process', $ID );
+    }
 }
 
 sub process {
@@ -444,10 +535,12 @@ sub prepare {
     # store our ID in context
     $c->{_POE_ID} = $ID;
     
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
     $client->{context} = $c;
 
     $client->{_prepare_done} = 0;
+    
+    BENCH && $client->{stopwatch}->lap('prepare');
     
     $poe_kernel->yield( 'handle_prepare', 'prepare_request', $ID );
     $poe_kernel->yield( 'handle_prepare', 'prepare_connection', $ID );
@@ -456,13 +549,15 @@ sub prepare {
     $poe_kernel->yield( 'handle_prepare', 'prepare_cookies', $ID );
     $poe_kernel->yield( 'handle_prepare', 'prepare_path', $ID );
     
-    # On-demand parsing
+    # If parse_on_demand is set, prepare_body will be called later
     unless ( $c->config->{parse_on_demand} ) {
         $poe_kernel->yield( 'handle_prepare', 'prepare_body', $ID );
         
-         # prepare_body will call prepare_done after reading all data
+         # prepare_body calls prepare_done after reading all data
     }
     else {
+        # Parse on demand will call prepare_body later, so we're done with 
+        # the rest of the prepare cycle now
         $poe_kernel->yield( 'prepare_done', $ID );
     }
 
@@ -483,7 +578,9 @@ sub handle_prepare {
     
     DEBUG && warn "[$ID] [$$] - $method\n";
     
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap(" - $method");
     
     {
         local (*ENV) = $client->{env};
@@ -495,11 +592,24 @@ sub prepare_body {
     my ( $self, $c ) = @_;
 
     my $ID = $c->{_POE_ID};
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap('prepare_body');
     
     # Initialize the HTTP::Body object
     my $type   = $c->request->header('Content-Type');
-    my $length = $c->request->header('Content-Length') || 0;
+    my $length = $c->request->header('Content-Length') 
+        || length( $client->{inputbuf} ) 
+        || 0;
+    
+    # Catalyst >= 5.7007 has support for bypassing HTTP::Body object
+    if ( !$length && $Catalyst::VERSION ge '5.7007' ) {
+        # Defined but will cause all body code to be skipped
+        $c->request->{_body} = 0;
+        
+        $poe_kernel->yield( 'prepare_done', $ID );
+        return;
+    }
 
     unless ( $c->request->{_body} ) {
         $c->request->{_body} = HTTP::Body->new( $type, $length );
@@ -507,69 +617,43 @@ sub prepare_body {
 
     if ( !$length ) {
         # Nothing to parse, we're done
-        return $poe_kernel->yield( 'prepare_done', $ID );
+        $poe_kernel->yield( 'prepare_done', $ID );
+        return;
     }
    
-    DEBUG && warn "[$ID] [$$] Starting to read POST data (length: $length)\n";
-
-    # set block size to read
-    my $driver = $client->{driver};
-    $driver->[ $driver->BLOCK_SIZE ] = BLOCK_SIZE;
+    DEBUG && warn "[$ID] [$$] Processing body data (total length: $length)\n";
 
     # Read some more data
     $client->{_prepare_body_done} = 0;
-    $client->{_read_position}     = 0;
-    $poe_kernel->select_read( $client->{socket}, 'read_body_chunk', $ID );
+    $client->{_read}              = 0;
+    $client->{_read_length}       = $length;
+    
+    # First process any data that is already in our input buffer
+    if ( $client->{inputbuf} ) {
+        _process_chunk( $client );
+    }
+    
+    # If we have more body data to read, this will be processed in process_input
 
     # We need to wait until all body data is read before returning
     while ( !$client->{_prepare_body_done} ) {
         $poe_kernel->run_one_timeslice();
     }
-}
-
-sub read_body_chunk {
-    my ( $kernel, $self, $handle, $ID ) = @_[ KERNEL, OBJECT, ARG0, ARG2 ];
-
-    my $client = $self->{clients}->{$ID};
-
-    DEBUG && warn "[$ID] [$$] read_body_chunk\n";
-
-    if ( my $buffer_ref = $client->{driver}->get( $handle ) ) {
-        for my $buffer ( @{$buffer_ref} ) {
-#            DEBUG && warn "$buffer\n";
-            $client->{_read_position} += length $buffer;
-            $client->{context}->prepare_body_chunk( $buffer );
-        }
-    }
-
-    my $body = $client->{context}->request->{_body};
-
-    # paranoia against wrong Content-Length header
-    if ( $client->{_read_position} > $body->length ) {
-        $kernel->select_read( $handle );
-        $client->{_prepare_body_done} = 1;
-        Catalyst::Exception->throw(
-            "Wrong Content-Length value: " . $body->length
-        );
-        return $kernel->yield( 'prepare_done', $ID );
-    }
-
-    # We're done when HTTP::Body's status changes to done
-    if ( $body->state eq 'done' ) {
-        # All done reading
-        $kernel->select_read( $handle );
-        $client->{_prepare_body_done} = 1;
-        return $kernel->yield( 'prepare_done', $ID );
-    }
+    
+    $poe_kernel->yield( 'prepare_done', $ID );
 }
 
 sub prepare_done {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
     
+    my $client = $self->{clients}->{$ID} || return;
+    
     DEBUG && warn "[$ID] [$$] prepare_done\n";
-#    DEBUG && warn Data::Dump::dump( $self->{clients}->{$ID}->{context} );
+#    DEBUG && warn dump( $self->{clients}->{$ID}->{context} );
 
-    $self->{clients}->{$ID}->{_prepare_done} = 1;
+    $client->{_prepare_done} = 1;
+    
+    BENCH && $client->{stopwatch}->lap('prepare_done');
 }
 
 # Finalize handles the entire finalize stage
@@ -577,7 +661,9 @@ sub finalize {
     my ( $self, $c ) = @_;
 
     my $ID = $c->{_POE_ID};
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap('finalize');
 
     $client->{_finalize_done} = 0;
 
@@ -605,7 +691,9 @@ sub handle_finalize {
     
     DEBUG && warn "[$ID] [$$] - $method\n";
 
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap(" - $method");
 
     # Set the response body to null when we're doing a HEAD request.
     # Must be done here so finalize_headers can still set the proper
@@ -622,22 +710,39 @@ sub handle_finalize {
 sub finalize_headers {
     my ( $self, $c ) = @_;
 
-    my $client = $self->{clients}->{ $c->{_POE_ID} };
-
-    my $protocol = $c->request->protocol;
+    my $client = $self->{clients}->{ $c->{_POE_ID} } || return;
+    
+    BENCH && $client->{stopwatch}->lap('finalize_headers');
+    
+    my $protocol = 'HTTP/1.0'; # We're not HTTP/1.1 (yet)
     my $status   = $c->response->status;
     my $message  = HTTP::Status::status_message($status);
 
-    $client->{wheel}->put( "$protocol $status $message\015\012" );
-    $c->response->headers->date( time );
-
-    $c->response->header( Status => $c->response->status );
+    my @headers;
+    push @headers, "$protocol $status $message";
     
-    # XXX: Keep-Alive support?
-    $c->response->header( Connection => 'close' );
+    $c->response->headers->header( Date => HTTP::Date::time2str(time) );
 
-    $client->{wheel}->put( $c->response->headers->as_string("\015\012") );
-    $client->{wheel}->put( "\015\012" );
+    # Some notes: I found that to get keepalive mode to perform well under ab,
+    # I had to send all data in a single put() call, so the second put in write() below is
+    # what caused keepalive to be so slow.  Not sure if this is just a quirk with ab
+    # or really a performance problem. :(
+    
+    # Should we keep the connection open?
+    my $connection = $c->request->header('Connection');
+    if ( $connection && $connection =~ /^keep-alive$/i ) {
+        $c->response->headers->header( Connection => 'keep-alive' );
+        $client->{_keepalive} = 1;
+    }
+    else {
+        $c->response->headers->header( Connection => 'close' );
+    }
+    
+    push @headers, $c->response->headers->as_string("\x0D\x0A");
+    
+    # Buffer the headers so they are sent with the first write() call
+    # This reduces the number of TCP packets we are sending
+    $client->{_header_buf} = join("\x0D\x0A", @headers, '');
 }
 
 sub finalize_done {
@@ -645,26 +750,37 @@ sub finalize_done {
     
     DEBUG && warn "[$ID] [$$] finalize_done\n";
 
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    # If we did not send our headers yet (we had no body), send them now
+    if ( my $headers = delete $client->{_header_buf} ) {
+        $client->{wheel}->put( $headers );
+    }
 
     $client->{_finalize_done} = 1;
+    
+    BENCH && $client->{stopwatch}->lap('finalize_done');
 }
 
 sub write {
     my ( $self, $c, $buffer ) = @_;
 
     my $ID = $c->{_POE_ID};
-    my $client = $self->{clients}->{$ID};
-
-    $client->{_highmark_reached} = $client->{wheel}->put( $buffer );
-
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap('write');
+    
     # keep track of the amount of data we've sent
-    $client->{_written} ||= 0;
-    my $cl = $client->{context}->response->content_length;
-    if ( $cl ) {
-        $client->{_written} += length $buffer;
-        DEBUG && warn "[$ID] [$$] written: " . $client->{_written} . "\n";
+    $client->{_written} += length $buffer;
+    DEBUG && warn "[$ID] [$$] written: " . $client->{_written} . "\n";
+    
+    # Add headers to the first write() call
+    if ( my $headers = delete $client->{_header_buf} ) {
+        $client->{_highmark_reached} = $client->{wheel}->put( $headers . $buffer );
     }
+    else {
+        $client->{_highmark_reached} = $client->{wheel}->put( $buffer );
+    }    
 
     # if the output buffer has reached the highmark, we have a
     # lot of outgoing data.  Don't return until it's been sent
@@ -680,13 +796,18 @@ sub write {
 sub client_flushed {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
 
-    my $client = $self->{clients}->{$ID};
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && $client->{stopwatch}->lap('client_flushed');
 
     # Are we done writing?
-    my $cl = $client->{context}->response->content_length;
-    if ( $cl && $client->{_written} >= $cl ) {
-        DEBUG && warn "[$ID] [$$] client_flushed, written full content-length\n";
-        $kernel->yield( 'client_done', $ID );
+    if ( $client->{context} ) {
+        my $cl = $client->{context}->response->content_length;
+        if ( $cl && $client->{_written} >= $cl ) {
+            DEBUG && warn "[$ID] [$$] client_flushed, written full content-length\n";
+            $kernel->yield( 'client_done', $ID );
+            return;
+        }
     }
 
     # if we get this event because of the highmark being reached
@@ -702,14 +823,76 @@ sub client_flushed {
 
 sub client_done {
     my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
+    
+    my $client = $self->{clients}->{$ID} || return;
+    
+    BENCH && warn "[$ID] [$$] Stopwatch:\n" . $client->{stopwatch}->stop->summary;
 
-    # clean up everything about this client
+    # clean up everything about this client unless we are using keepalive
+    if ( $client->{_keepalive} ) {
+        DEBUG && warn "[$ID] [$$] client_done, keepalive enabled, waiting for more requests\n";
+        $client->{requests}++;
+        
+        # Clear important variables from the previous state
+        delete $client->{_headers};
+        delete $client->{_written};
+        delete $client->{_read};
+        
+        if ( BENCH ) {
+            $client->{stopwatch} = Benchmark::Stopwatch->new->start;
+        }
+
+        # timeout idle connection after some seconds
+        $client->{_timeout_timer} = $kernel->delay_set( 'keepalive_timeout', KEEPALIVE_TIMEOUT, $ID );
+    }
+    else {
+        DEBUG && warn "[$ID] [$$] client_done, closing connection\n";
+        delete $self->{clients}->{$ID};
+    }
+}
+
+sub keepalive_timeout {
+    my ( $kernel, $self, $ID ) = @_[ KERNEL, OBJECT, ARG0 ];
+    
+    DEBUG && warn "[$ID] [$$] Timing out idle keepalive connection\n";
+    
     delete $self->{clients}->{$ID};
+}
 
-    DEBUG && warn "[$ID] [$$] client_done\n";
+# Process a chunk of body data
+sub _process_chunk {
+    my $client = shift;
+    
+    # Read no more than content-length
+    my $cl = $client->{env}->{CONTENT_LENGTH} || length( $client->{inputbuf} ) || 0;
+
+    my $buf  = substr $client->{inputbuf}, 0, $cl, '';
+    my $read = length($buf);
+    
+    return unless $read;
+        
+    $client->{context}->prepare_body_chunk( $buf );
+
+    $client->{_read} += $read;
+    
+    if ( DEBUG ) {
+        my $ID   = $client->{wheel}->ID;
+        my $togo = $client->{_read_length} - $client->{_read};
+        warn "[$ID] [$$] prepare_body: Read $read bytes ($togo to go)\n";
+    }
+    
+    # Is that all the body data?
+    if ( $client->{_read} >= $client->{_read_length} ) {
+        # Some browsers (like MSIE 5.01) send extra CRLFs after the content
+        # so we need to strip it away
+        $client->{inputbuf} =~ s/^\s+//;
+        
+        $client->{_prepare_body_done} = 1;
+    }
 }
 
 1;
+__END__
 
 =head1 NAME
 
@@ -757,8 +940,8 @@ USR1 signal to the running process.
 
 =head1 EXPERIMENTAL STATUS
 
-This engine should still be considered experimental and likely has bugs, however as
-it's only intended for development, please use it and report bugs.
+This engine should still be considered experimental and likely has bugs,
+however as it's only intended for development, please use it and report bugs.
 
 The engine has been tested with the UploadProgress demo, the Streaming example,
 and one of my own moderately large applications.  It also fully passes the Catalyst
