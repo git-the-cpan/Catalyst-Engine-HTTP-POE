@@ -8,7 +8,7 @@ use lib "$FindBin::Bin/lib";
 
 our $iters;
 
-BEGIN { $iters = $ENV{CAT_BENCH_ITERS} || 2; }
+BEGIN { $iters = $ENV{CAT_BENCH_ITERS} || 1; }
 
 use Test::More tests => 18*$iters;
 use Catalyst::Test 'TestApp';
@@ -30,7 +30,7 @@ sub run_tests {
           TestApp::Controller::Action::Detach->one
           TestApp::Controller::Action::Detach->two
           TestApp::View::Dump::Request->process
-	  TestApp->end
+          TestApp->end
         ];
 
         my $expected = join( ", ", @expected );
@@ -57,7 +57,7 @@ sub run_tests {
           TestApp::Controller::Action::Detach->path
           TestApp::Controller::Action::Detach->two
           TestApp::View::Dump::Request->process
-	  TestApp->end
+          TestApp->end
         ];
 
         my $expected = join( ", ", @expected );

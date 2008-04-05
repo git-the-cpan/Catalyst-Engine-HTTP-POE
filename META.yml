@@ -1,20 +1,19 @@
----
-name: Catalyst-Engine-HTTP-POE
-version: 0.06
-author:
-  - 'Andy Grundman, <andy@hybridized.org>'
-abstract: Single-threaded multi-tasking Catalyst engine
+--- 
+abstract: Single-threaded multi-tasking Catalyst engine (deprecated in favor of HTTP::Prefork)
+author: Andy Grundman, <andy@hybridized.org>
+distribution_type: module
+generated_by: Module::Install version 0.65
 license: perl
-resources:
-  license: http://dev.perl.org/licenses/
-requires:
-  Catalyst: 5.67
+meta-spec: 
+  url: http://module-build.sourceforge.net/META-spec-v1.3.html
+  version: 1.3
+name: Catalyst-Engine-HTTP-POE
+no_index: 
+  directory: 
+    - inc
+    - t
+requires: 
+  Catalyst::Runtime: 0
   POE: 0
-provides:
-  Catalyst::Engine::HTTP::POE:
-    file: lib/Catalyst/Engine/HTTP/POE.pm
-    version: 0.06
-generated_by: Module::Build version 0.2806
-meta-spec:
-  url: http://module-build.sourceforge.net/META-spec-v1.2.html
-  version: 1.2
+tests: t/0*.t
+version: 0.07

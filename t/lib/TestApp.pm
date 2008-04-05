@@ -5,6 +5,7 @@ use Catalyst qw/
     Test::Errors 
     Test::Headers 
     Test::Plugin
+    Test::Inline
     +TestApp::Plugin::FullyQualified
 /;
 use Catalyst::Utils;
@@ -55,6 +56,17 @@ sub execute {
     return $c->SUPER::execute(@_);
 }
 
+# Replace the very large HTML error page with
+# useful info if something crashes during a test
+sub finalize_error {
+    my $c = shift;
+    
+    $c->NEXT::finalize_error(@_);
+    
+    $c->res->status(500);
+    $c->res->body( 'FATAL ERROR: ' . join( ', ', @{ $c->error } ) );
+}
+
 sub class_forward_test_method :Private {
     my ( $self, $c ) = @_;
     $c->response->headers->header( 'X-Class-Forward-Test-Method' => 1 );
@@ -77,4 +89,13 @@ sub recursion_test : Local {
     no warnings 'redefine';
     sub Catalyst::Log::error { }
 }
+
+# Make sure we can load Inline plugins. 
+
+package Catalyst::Plugin::Test::Inline;
+
+use strict;
+
+use base qw/Catalyst::Base Class::Data::Inheritable/;
+
 1;

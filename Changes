@@ -1,5 +1,14 @@
 This file documents the revision history for Catalyst::Engine::HTTP::POE.
 
+0.07    2008-04-05 11:30:00
+        - Deprecated in favor of HTTP::Prefork.
+        - Sending SIGHUP to the server will now cause it to restart.
+        - Sending SIGTERM will now properly shut down the server.
+        - Removed time prefix from warn calls.
+        - Allow custom alias to be passed in.
+        - Added $kernel->call('status') method for retrieving current status.
+        - Switch to Module::Install.
+
 0.06  2007-02-27 16:00:00
         - Keep-alive support.
         - Improve performance by buffering header output and sending with the first

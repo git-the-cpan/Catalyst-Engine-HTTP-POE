@@ -1,12 +1,16 @@
 NAME
     Catalyst::Engine::HTTP::POE - Single-threaded multi-tasking Catalyst
-    engine
+    engine (deprecated in favor of HTTP::Prefork)
 
 SYNOPIS
         CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
-    
-        # Prefork 5 children
+        
+    # Prefork 5 children
         CATALYST_POE_MAX_PROC=6 CATALYST_ENGINE='HTTP::POE' script/yourapp_server.pl
+
+DEPRECATED
+    This engine has been deprecated. Please consider using
+    Catalyst::Engine::HTTP::Prefork instead.
 
 DESCRIPTION
     This engine allows Catalyst to process multiple requests in parallel

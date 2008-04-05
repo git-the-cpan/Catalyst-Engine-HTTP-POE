@@ -6,7 +6,7 @@ use warnings;
 use FindBin;
 use lib "$FindBin::Bin/lib";
 
-use Test::More tests => 28;
+use Test::More tests => 30;
 use Catalyst::Test 'TestApp';
 
 use Catalyst::Request;
@@ -41,8 +41,9 @@ use URI;
     my $creq;
 
     my $parameters = {
-        'a' => [qw(A b C d E f G)],
-        '%' => [ '%', '"', '& - &' ],
+        'a'     => [qw(A b C d E f G)],
+        '%'     => [ '%', '"', '& - &' ],
+        'blank' => '',
     };
 
     my $request = POST(
@@ -78,7 +79,8 @@ use URI;
     my $creq;
 
     my $parameters = {
-        'url' => 'http://www.google.com',
+        'url'   => 'http://www.google.com',
+        'blank' => '',
     };
 
     my $request = POST( 'http://localhost/dump/request',
@@ -96,18 +98,21 @@ use URI;
     my $creq;
     
     my $parameters = {
-        a => 1,
+        a     => 1,
+        blank => '',
     };
 
     my $request = POST(
-        'http://localhost/dump/request/a/b?query_string',
+        'http://localhost/dump/request/a/b?query+string',
         'Content'      => $parameters,
         'Content-Type' => 'application/x-www-form-urlencoded'
     );
     
     ok( my $response = request($request), 'Request' );
     ok( eval '$creq = ' . $response->content, 'Unserialize Catalyst::Request' );
-    is( $creq->{uri}->query, 'query_string', 'Catalyst::Request POST query_string' );
+    is( $creq->{uri}->query, 'query+string', 'Catalyst::Request POST query_string' );
+    is( $creq->query_keywords, 'query string', 'Catalyst::Request query_keywords' );
+    is_deeply( $creq->{parameters}, $parameters, 'Catalyst::Request parameters' );
     
     ok( $response = request('http://localhost/dump/request/a/b?x=1&y=1&z=1'), 'Request' );
     ok( eval '$creq = ' . $response->content, 'Unserialize Catalyst::Request' );
