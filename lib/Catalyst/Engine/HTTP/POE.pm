@@ -19,7 +19,7 @@ use Time::HiRes;
 
 use Catalyst::Engine::HTTP::Restarter::Watcher;
 
-our $VERSION = '0.07';
+our $VERSION = '0.08';
 
 # Enable for helpful debugging information
 sub DEBUG () { $ENV{CATALYST_POE_DEBUG} || 0 }

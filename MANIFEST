@@ -11,7 +11,6 @@ inc/Module/Install/Metadata.pm
 inc/Module/Install/Win32.pm
 inc/Module/Install/WriteAll.pm
 lib/Catalyst/Engine/HTTP/POE.pm
-lib/Catalyst/Engine/HTTP/POE/YieldCC.pm
 Makefile.PL
 MANIFEST			This list of files
 META.yml

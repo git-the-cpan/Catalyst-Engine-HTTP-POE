@@ -16,4 +16,4 @@ requires:
   Catalyst::Runtime: 0
   POE: 0
 tests: t/0*.t
-version: 0.07
+version: 0.08
